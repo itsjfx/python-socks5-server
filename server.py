@@ -14,6 +14,7 @@ RESERVED = 0
 FAILURE = 0xFF
 USERNAME_PASSWORD_VERSION = 1
 CONNECTION_TIMEOUT = 60 * 15 * 1000
+COPY_LOOP_BUFFER_SIZE = 4096
 
 # Buffer sizes
 GREETING_SIZE = 2
@@ -59,6 +60,7 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 	def handle(self):
 		logging.info('Accepting connection from %s:%s' % self.client_address)
 
+		# Handle the greeting
 		# Greeting header
 		header = self._recv(GREETING_SIZE, self._send_greeting_failure, AuthMethod.Invalid)
 		version, nmethods = struct.unpack("!BB", header)
@@ -85,16 +87,27 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 		if self.server.auth:
 			self._verify_credentials()
 
-		# Auth done...
-		# request
+		# Auth/greeting handled...
 		logging.debug("Successfully authenticated")
 
+		# Handle the request
 		conn_buffer = self._recv(CONN_NO_PORT_SIZE, self._send_failure, StatusCode.GeneralFailure)
 		version, cmd, rsv, address_type = struct.unpack("!BBBB", conn_buffer)
-		if version != SOCKS_VERSION:
-			self._send_greeting_failure(self.auth_method)
+		# Do this so we can send an address_type in our errors
+		# We don't want to send an invalid one back in an error so we will handle an invalid address type first
+		# Microsocks just always sends IPv4 instead
+		if address_type in [AddressDataType.IPv4, AddressDataType.IPv6, AddressDataType.DomainName]:
+			self._address_type = address_type
+		else:
+			self._send_failure(StatusCode.AddressTypeNotSupported)
 
-		self._address_type = address_type
+		if version != SOCKS_VERSION:
+			self._send_failure(StatusCode.GeneralFailure)
+		if cmd != CONNECT: # We only support connect
+			self._send_failure(StatusCode.CommandNotSupported)
+		if rsv != RESERVED: # Malformed packet
+			self._send_failure(StatusCode.GeneralFailure)
+
 		logging.debug(f'Handling request with address type: {address_type}')
 
 		if address_type == AddressDataType.IPv4 or address_type == AddressDataType.IPv6: # IPv4 or IPv6
@@ -115,8 +128,7 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 			if domain_length > 255: # Invalid
 				self._send_failure(StatusCode.GeneralFailure)
 			address = self._recv(domain_length, self._send_failure, StatusCode.GeneralFailure)
-		else:
-			self._send_failure(StatusCode.AddressTypeNotSupported)
+
 		port_buffer = self._recv(CONN_PORT_SIZE, self._send_failure, StatusCode.GeneralFailure)
 		port = struct.unpack('!H', port_buffer)[0]
 
@@ -131,12 +143,6 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 			self._send_failure(StatusCode.GeneralFailure)
 		
 		af, socktype, proto, _, sa = remote_info
-
-		if cmd != CONNECT: # We only support connect
-			self._send_failure(StatusCode.CommandNotSupported)
-
-		if rsv != RESERVED: # Malformed packet
-			self._send_failure(StatusCode.GeneralFailure)
 
 		# Connect to the socket
 		try:
@@ -157,8 +163,8 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 		# TO-DO: Are the BND.ADDR and BND.PORT returned correct values?
 		self._send(struct.pack("!BBBBIH", SOCKS_VERSION, StatusCode.Success, RESERVED, AddressDataType.IPv4, addr, port))
 
-		# Establish data exchange
-		self._exchange_loop(self.request, self._remote)
+		# Run the copy loop
+		self._copy_loop(self.request, self._remote)
 		self._exit(True)
 
 	@property
@@ -191,7 +197,7 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 		"""Convenience method to exit the thread and cleanup any connections"""
 		self._shutdown_client()
 		if hasattr(self, "_remote"):
-			self._remote.shutdown(socket.SHUT_RDWR)
+			#self._remote.shutdown(socket.SHUT_RDWR)
 			self._remote.close()
 		if not dontExit:
 			sys.exit()
@@ -241,10 +247,11 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 		self._send(struct.pack("!BBBBIH", SOCKS_VERSION, code, RESERVED, address_type, 0, 0))
 		self._exit()
 
-	# TO-DO: Rewrite this function
-	def _exchange_loop(self, client, remote):
+	def _copy_loop(self, client, remote):
+		"""Waits for network activity and forwards it to the other connection"""
 		while True:
 			# Wait until client or remote is available for read
+			#
 			# Alternatively use poll() instead of select() due to these reasons
 			# https://github.com/rofl0r/microsocks/commit/31557857ccce5e4fdd2cfdae7ab640d589aa2b41
 			# May not be ideal for a cross platform implementation however
@@ -254,15 +261,25 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 			if not r and not w and not e:
 				self._send_failure(StatusCode.TTLExpired)
 
-			if client in r:
-				data = client.recv(4096)
-				if remote.send(data) <= 0:
-					break
-
-			if remote in r:
-				data = remote.recv(4096)
-				if client.send(data) <= 0:
-					break
+			for sock in r:
+				try:
+					data = sock.recv(COPY_LOOP_BUFFER_SIZE)
+				except Exception as err:
+					logging.debug("Copy loop failed to read")
+					logging.error(err)
+					return
+				
+				if not data or len(data) <= 0:
+					return
+				
+				outfd = remote if sock is client else client
+				try:
+					outfd.sendall(data) # Python has its own sendall implemented
+				except:
+					logging.debug("Copy loop failed to send all data")
+					logging.error(err)
+					return
+				
 
 
 if __name__ == '__main__':
