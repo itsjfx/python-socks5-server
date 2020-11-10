@@ -15,6 +15,7 @@ FAILURE = 0xFF
 USERNAME_PASSWORD_VERSION = 1
 CONNECTION_TIMEOUT = 60 * 15 * 1000
 COPY_LOOP_BUFFER_SIZE = 4096
+BIND_PORT = 0 # set to 0 if we are binding an address, lets the kernel decide a free port
 
 # Buffer sizes
 GREETING_SIZE = 2
@@ -49,14 +50,21 @@ class AddressDataType:
 	IPv6 = 4
 
 class ThreadingTCPServer(ThreadingMixIn, TCPServer):
-	pass
+	def __init__(self, host_port_tuple, streamhandler, options={}):
+		self._options = options
+		# Check types, if the options are valid
+		if 'bind_address' in options:
+			# This should error out if invalid
+			bind_addr_info = socket.getaddrinfo(options['bind_address'], BIND_PORT, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+			if len(bind_addr_info) > 0:
+				self._options['_bind'] = bind_addr_info[0][4] # Is picking first a good idea?
+			else:
+				logging.error("Failed to resolve bind address")
+				sys.exit()
+		super().__init__(host_port_tuple, streamhandler)
+		
 
 class SOCKS5ProxyServer(BaseRequestHandler):
-	def setup(self):
-		super(SOCKS5ProxyServer, self).setup()
-		if not hasattr(self.server, "auth"):
-			self.server.auth = False
-
 	def handle(self):
 		logging.info('Accepting connection from %s:%s' % self.client_address)
 
@@ -77,14 +85,14 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 
 		# Accept only USERNAME/PASSWORD auth if we are asking for auth
 		# Accept only no auth if we are not asking for USERNAME/PASSWORD
-		if (self.server.auth and AuthMethod.UsernamePassword not in set(methods)) or (not self.server.auth and AuthMethod.NoAuth not in set(methods)):
+		if ('auth' in self.server._options and AuthMethod.UsernamePassword not in set(methods)) or (not 'auth' in self.server._options and AuthMethod.NoAuth not in set(methods)):
 			self._send_greeting_failure(AuthMethod.Invalid)
 
 		# Choose an authentication method and send it to the client
 		self._send(struct.pack("!BB", SOCKS_VERSION, self.auth_method))
 
 		# If we are asking for USERNAME/PASSWORD auth verify it
-		if self.server.auth:
+		if 'auth' in self.server._options:
 			self._verify_credentials()
 
 		# Auth/greeting handled...
@@ -146,7 +154,11 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 
 		# Connect to the socket
 		try:
+			# Make the socket
 			self._remote = socket.socket(af, socktype, proto)
+			# Bind it to an IP
+			if '_bind' in self.server._options:
+				self._remote.bind(self.server._options['_bind'])
 			self._remote.connect(sa)
 			bind_address = self._remote.getsockname()
 			logging.info(f'Connected to {address} {port}')
@@ -170,7 +182,7 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 	@property
 	def auth_method(self):
 		"""Gives us the authentication method we will use"""
-		return AuthMethod.UsernamePassword if self.server.auth else AuthMethod.NoAuth
+		return AuthMethod.UsernamePassword if 'auth' in self.server._options else AuthMethod.NoAuth
 
 	def _send(self, data):
 		"""Convenience method to send bytes to a client"""
@@ -224,7 +236,7 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 		password_len = self._recv(PW_LEN_SIZE, self._send_authentication_failure, FAILURE)
 		password = self._recv(ord(password_len), self._send_authentication_failure, FAILURE)
 
-		if username.decode('utf-8') == self.server.auth[0] and password.decode('utf-8') == self.server.auth[1]:
+		if username.decode('utf-8') == self.server._options['auth'][0] and password.decode('utf-8') == self.server._options['auth'][1]:
 			self._send(struct.pack("!BB", USERNAME_PASSWORD_VERSION, StatusCode.Success))
 			return True
 
@@ -285,7 +297,5 @@ class SOCKS5ProxyServer(BaseRequestHandler):
 if __name__ == '__main__':
 	# TO-DO: Add CLI args for options
 	# Add to seperate file?
-	with ThreadingTCPServer(('0.0.0.0', 1080), SOCKS5ProxyServer) as server:
-		server.auth = ("username", "password")
-		#server.auth = False
+	with ThreadingTCPServer(('0.0.0.0', 1080), SOCKS5ProxyServer, {"bind_address": "10.10.10.21"}) as server:
 		server.serve_forever()
