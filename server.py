@@ -50,6 +50,7 @@ class AddressDataType:
 	IPv6 = 4
 
 class SOCKS5ProxyServer(ThreadingMixIn, TCPServer):
+	"""Just the server which will process a dictionary of options and initialise the socket server"""
 	def __init__(self, options):
 		options = options or {}
 		# Check types, if the options are valid
@@ -82,6 +83,10 @@ class SOCKS5ProxyServer(ThreadingMixIn, TCPServer):
 		
 
 class SOCKS5ProxyHandler(BaseRequestHandler):
+	"""The handler used for a request from a client.
+		Make sure _bind and _auth is set in self.server (like in SOCKS5ProxyServer) if a custom server uses this handler
+		in order to use username and password authentication or use binding for the request socket
+	"""
 	def handle(self):
 		logging.info('Accepting connection from %s:%s' % self.client_address)
 
