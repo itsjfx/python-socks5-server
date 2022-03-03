@@ -311,7 +311,7 @@ class SOCKS5ProxyHandler(BaseRequestHandler):
 				outfd = remote if sock is client else client
 				try:
 					outfd.sendall(data) # Python has its own sendall implemented
-				except:
+				except Exception as err:
 					logging.debug("Copy loop failed to send all data")
 					logging.error(err)
 					return
